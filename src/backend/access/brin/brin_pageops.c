@@ -237,8 +237,11 @@ brin_doupdate(Relation idxrel, BlockNumber pagesPerRange,
 		OffsetNumber newoff;
 		Size		freespace = 0;
 
+        elog(DEBUG1, "sleep while update");
+        sleep(15);
+        elog(DEBUG1, "Try to revmap for update reg page - update");
 		revmapbuf = brinLockRevmapPageForUpdate(revmap, heapBlk);
-
+        elog(DEBUG1, "Try to revmap for update reg page - update");
 		START_CRIT_SECTION();
 
 		/*

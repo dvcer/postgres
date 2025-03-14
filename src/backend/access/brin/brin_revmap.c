@@ -335,6 +335,7 @@ brinRevmapDesummarizeRange(Relation idxrel, BlockNumber heapBlk)
 	OffsetNumber revmapOffset;
 	OffsetNumber regOffset;
 	ItemId		lp;
+    BlockNumber oldbn;
 
 	revmap = brinRevmapInitialize(idxrel, &pagesPerRange);
 
@@ -346,8 +347,10 @@ brinRevmapDesummarizeRange(Relation idxrel, BlockNumber heapBlk)
 		return true;
 	}
 
-	/* Lock the revmap page, obtain the index tuple pointer from it */
-	revmapBuf = brinLockRevmapPageForUpdate(revmap, heapBlk);
+    /* Get revmap page, lock it and obtain the index tuple pointer from it */
+	revmapBuf = revmap_get_buffer(revmap, heapBlk);
+    LockBuffer(revmapBuf, BUFFER_LOCK_SHARE);
+
 	revmapPg = BufferGetPage(revmapBuf);
 	revmapOffset = HEAPBLK_TO_REVMAP_INDEX(revmap->rm_pagesPerRange, heapBlk);
 
@@ -363,12 +366,36 @@ brinRevmapDesummarizeRange(Relation idxrel, BlockNumber heapBlk)
 		return true;
 	}
 
+    /* Save index tuple block number so we can check later that index tuple wasn't moved */
+    oldbn = ItemPointerGetBlockNumber(iptr);
+
+    /* To avoid deadlock, we need to lock reg page before revmap page, so unlock revmap page for a while */
+    LockBuffer(revmapBuf, BUFFER_LOCK_UNLOCK);
+
 	regBuf = ReadBuffer(idxrel, ItemPointerGetBlockNumber(iptr));
 	LockBuffer(regBuf, BUFFER_LOCK_EXCLUSIVE);
+
+    /*
+     * Lock revmap page and make some checks to be sure
+     * that index tuple still exists and locates in the locked regular page
+    */
+    revmapBuf = brinLockRevmapPageForUpdate(revmap, heapBlk);
+    iptr = contents->rm_tids;
+    iptr += revmapOffset;
+
+    if (!ItemPointerIsValid(iptr))
+    {
+        /* Somebody has already desummarized the range, we're done  */
+        LockBuffer(revmapBuf, BUFFER_LOCK_UNLOCK);
+        LockBuffer(regBuf, BUFFER_LOCK_UNLOCK);
+        brinRevmapTerminate(revmap);
+        return true;
+    }
+
 	regPg = BufferGetPage(regBuf);
 
-	/* if this is no longer a regular page, tell caller to start over */
-	if (!BRIN_IS_REGULAR_PAGE(regPg))
+	/* if this is no longer a regular page or index tuple was moved to another page, tell caller to start over */
+    if (!BRIN_IS_REGULAR_PAGE(regPg) || ItemPointerGetBlockNumber(iptr) != oldbn)
 	{
 		LockBuffer(revmapBuf, BUFFER_LOCK_UNLOCK);
 		LockBuffer(regBuf, BUFFER_LOCK_UNLOCK);
