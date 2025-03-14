@@ -3,6 +3,7 @@
 amcheck_sources = files(
   'verify_heapam.c',
   'verify_nbtree.c',
+  'verify_brinam.c'
 )
 
 if host_system == 'windows'
@@ -24,6 +25,7 @@ install_data(
   'amcheck--1.1--1.2.sql',
   'amcheck--1.2--1.3.sql',
   'amcheck--1.3--1.4.sql',
+  'amcheck--1.4--1.5.sql',
   kwargs: contrib_data_args,
 )
 
