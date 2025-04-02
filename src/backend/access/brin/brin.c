@@ -1496,7 +1496,6 @@ brin_desummarize_range(PG_FUNCTION_ARGS)
 	Oid			heapoid;
 	Relation	heapRel;
 	Relation	indexRel;
-	bool		done;
 
 	if (RecoveryInProgress())
 		ereport(ERROR,
@@ -1555,12 +1554,7 @@ brin_desummarize_range(PG_FUNCTION_ARGS)
 	/* see gin_clean_pending_list() */
 	if (indexRel->rd_index->indisvalid)
 	{
-		/* the revmap does the hard work */
-		do
-		{
-			done = brinRevmapDesummarizeRange(indexRel, heapBlk);
-		}
-		while (!done);
+		brinRevmapDesummarizeRange(indexRel, heapBlk);
 	}
 	else
 		ereport(DEBUG1,

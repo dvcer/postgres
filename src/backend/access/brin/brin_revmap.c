@@ -316,10 +316,8 @@ brinGetTupleForHeapBlock(BrinRevmap *revmap, BlockNumber heapBlk,
  * Delete an index tuple, marking a page range as unsummarized.
  *
  * Index must be locked in ShareUpdateExclusiveLock mode.
- *
- * Return false if caller should retry.
  */
-bool
+void
 brinRevmapDesummarizeRange(Relation idxrel, BlockNumber heapBlk)
 {
 	BrinRevmap *revmap;
@@ -327,26 +325,37 @@ brinRevmapDesummarizeRange(Relation idxrel, BlockNumber heapBlk)
 	RevmapContents *contents;
 	ItemPointerData *iptr;
 	ItemPointerData invalidIptr;
-	BlockNumber revmapBlk;
 	Buffer		revmapBuf;
-	Buffer		regBuf;
+	Buffer		regBuf = InvalidBuffer;
 	Page		revmapPg;
 	Page		regPg;
 	OffsetNumber revmapOffset;
 	OffsetNumber regOffset;
-	ItemId		lp;
+	BrinTuple  *btup;
+	Size		size;
 
 	revmap = brinRevmapInitialize(idxrel, &pagesPerRange);
 
-	revmapBlk = revmap_get_blkno(revmap, heapBlk);
-	if (!BlockNumberIsValid(revmapBlk))
+	/* Try to get index tuple for the target block number */
+	btup = brinGetTupleForHeapBlock(revmap, heapBlk, &regBuf, &regOffset, &size, BUFFER_LOCK_EXCLUSIVE);
+
+	/* If range is not summarized, release resources and we are done */
+	if (!btup)
 	{
-		/* revmap page doesn't exist: range not summarized, we're done */
+		if (BufferIsValid(regBuf))
+		{
+			ReleaseBuffer(regBuf);
+		}
 		brinRevmapTerminate(revmap);
-		return true;
+
+		return;
 	}
 
-	/* Lock the revmap page, obtain the index tuple pointer from it */
+	/*
+	 * We know that range is summarized (or it's a dangling placeholder), and
+	 * we have the regular page with the index tuple locked exclusively. Now
+	 * lock the revmap page with pointer to our index tuple
+	 */
 	revmapBuf = brinLockRevmapPageForUpdate(revmap, heapBlk);
 	revmapPg = BufferGetPage(revmapBuf);
 	revmapOffset = HEAPBLK_TO_REVMAP_INDEX(revmap->rm_pagesPerRange, heapBlk);
@@ -355,38 +364,22 @@ brinRevmapDesummarizeRange(Relation idxrel, BlockNumber heapBlk)
 	iptr = contents->rm_tids;
 	iptr += revmapOffset;
 
-	if (!ItemPointerIsValid(iptr))
+	/*
+	 * No concurrent updates for the range are possible as any update should
+	 * lock regular page first, and we already hold the lock. We know that
+	 * index tuple for the range exists, so revmap item pointer couldn't be
+	 * invalid and should point to index tuple btup.
+	 */
+	if (!ItemPointerIsValid(iptr) ||
+		ItemPointerGetBlockNumber(iptr) != BufferGetBlockNumber(regBuf) ||
+		ItemPointerGetOffsetNumber(iptr) != regOffset)
 	{
-		/* no index tuple: range not summarized, we're done */
-		LockBuffer(revmapBuf, BUFFER_LOCK_UNLOCK);
-		brinRevmapTerminate(revmap);
-		return true;
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("corrupted BRIN index: inconsistent range map")));
 	}
 
-	regBuf = ReadBuffer(idxrel, ItemPointerGetBlockNumber(iptr));
-	LockBuffer(regBuf, BUFFER_LOCK_EXCLUSIVE);
 	regPg = BufferGetPage(regBuf);
-
-	/* if this is no longer a regular page, tell caller to start over */
-	if (!BRIN_IS_REGULAR_PAGE(regPg))
-	{
-		LockBuffer(revmapBuf, BUFFER_LOCK_UNLOCK);
-		LockBuffer(regBuf, BUFFER_LOCK_UNLOCK);
-		brinRevmapTerminate(revmap);
-		return false;
-	}
-
-	regOffset = ItemPointerGetOffsetNumber(iptr);
-	if (regOffset > PageGetMaxOffsetNumber(regPg))
-		ereport(ERROR,
-				(errcode(ERRCODE_INDEX_CORRUPTED),
-				 errmsg("corrupted BRIN index: inconsistent range map")));
-
-	lp = PageGetItemId(regPg, regOffset);
-	if (!ItemIdIsUsed(lp))
-		ereport(ERROR,
-				(errcode(ERRCODE_INDEX_CORRUPTED),
-				 errmsg("corrupted BRIN index: inconsistent range map")));
 
 	/*
 	 * Placeholder tuples only appear during unfinished summarization, and we
@@ -429,8 +422,6 @@ brinRevmapDesummarizeRange(Relation idxrel, BlockNumber heapBlk)
 	UnlockReleaseBuffer(regBuf);
 	LockBuffer(revmapBuf, BUFFER_LOCK_UNLOCK);
 	brinRevmapTerminate(revmap);
-
-	return true;
 }
 
 /*
