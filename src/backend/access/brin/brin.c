@@ -573,14 +573,12 @@ bringetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	Relation	heapRel;
 	BrinOpaque *opaque;
 	BlockNumber nblocks;
-	BlockNumber heapBlk;
+	BlockNumber nblockidx;
 	int64		totalpages = 0;
 	FmgrInfo   *consistentFn;
 	MemoryContext oldcxt;
 	MemoryContext perRangeCxt;
 	BrinMemTuple *dtup;
-	BrinTuple  *btup = NULL;
-	Size		btupsz = 0;
 	ScanKey   **keys,
 			  **nullkeys;
 	int		   *nkeys,
@@ -588,6 +586,10 @@ bringetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	char	   *ptr;
 	Size		len;
 	char	   *tmp PG_USED_FOR_ASSERTS_ONLY;
+	ReadStream *stream;
+	int			stream_flags;
+	ReadStreamBlockNumberCB stream_cb;
+	BlockRangeReadStreamPrivate stream_data;
 
 	opaque = (BrinOpaque *) scan->opaque;
 	bdesc = opaque->bo_bdesc;
@@ -730,219 +732,262 @@ bringetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	perRangeCxt = AllocSetContextCreate(CurrentMemoryContext,
 										"bringetbitmap cxt",
 										ALLOCSET_DEFAULT_SIZES);
-	oldcxt = MemoryContextSwitchTo(perRangeCxt);
+
+
+	/* Scan the whole index relation and remove pages from bitmap if possible */
+
+	nblockidx = RelationGetNumberOfBlocks(idxRel);
+	stream_flags = READ_STREAM_SEQUENTIAL |
+		READ_STREAM_FULL |
+		READ_STREAM_USE_BATCHING;
+	stream_data.current_blocknum = BRIN_METAPAGE_BLKNO + 1;
+	stream_data.last_exclusive = nblockidx;
 
 	/*
-	 * Now scan the revmap.  We start by querying for heap page 0,
-	 * incrementing by the number of pages per range; this gives us a full
-	 * view of the table.
+	 * add custom callback with check if the index relation was extended, so
+	 * we don't miss any index tuple
+	 *
+	 * && idxBlk < (idxBlkNum = RelationGetNumberOfBlocks(idxRel)) index could
+	 * be extended while the scan, so that we don't miss any index tuples
+	 * recheck before finish
 	 */
-	for (heapBlk = 0; heapBlk < nblocks; heapBlk += opaque->bo_pagesPerRange)
+	stream_cb = block_range_read_stream_cb;
+	stream = read_stream_begin_relation(stream_flags,
+										GetAccessStrategy(BAS_BULKREAD),
+										idxRel,
+										MAIN_FORKNUM,
+										stream_cb,
+										&stream_data,
+										0);
+
+	oldcxt = MemoryContextSwitchTo(perRangeCxt);
+	while ((buf = read_stream_next_buffer(stream, NULL)) != InvalidBuffer)
 	{
-		bool		addrange;
-		bool		gottuple = false;
-		BrinTuple  *tup;
+		Page		page;
+		OffsetNumber maxoff;
 		OffsetNumber off;
-		Size		size;
+        Page pageCopy;
 
 		CHECK_FOR_INTERRUPTS();
 
 		MemoryContextReset(perRangeCxt);
 
-		tup = brinGetTupleForHeapBlock(opaque->bo_rmAccess, heapBlk, &buf,
-									   &off, &size, BUFFER_LOCK_SHARE);
-		if (tup)
+/* 		buf = ReadBuffer(idxRel, idxBlk); */
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+        page = BufferGetPage(buf);
+
+		/* Skip new & revmap pages */
+		if (PageIsNew(page) || BRIN_IS_REVMAP_PAGE(page))
 		{
-			gottuple = true;
-			btup = brin_copy_tuple(tup, size, btup, &btupsz);
-			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+			UnlockReleaseBuffer(buf);
+			continue;
 		}
 
-		/*
-		 * For page ranges with no indexed tuple, we must return the whole
-		 * range; otherwise, compare it to the scan keys.
-		 */
-		if (!gottuple)
+		if (!BRIN_IS_REGULAR_PAGE(page))
 		{
-			addrange = true;
+			ereport(ERROR, errmsg("Unknown page type while brin getbitmap, blkno %u", BufferGetBlockNumber(buf)));
 		}
-		else
-		{
-			dtup = brin_deform_tuple(bdesc, btup, dtup);
-			if (dtup->bt_placeholder)
-			{
-				/*
-				 * Placeholder tuples are always returned, regardless of the
-				 * values stored in them.
-				 */
-				addrange = true;
-			}
-			else
-			{
-				int			attno;
 
-				/*
-				 * Compare scan keys with summary values stored for the range.
-				 * If scan keys are matched, the page range must be added to
-				 * the bitmap.  We initially assume the range needs to be
-				 * added; in particular this serves the case where there are
-				 * no keys.
-				 */
-				addrange = true;
-				for (attno = 1; attno <= bdesc->bd_tupdesc->natts; attno++)
+        pageCopy = PageGetTempPageCopy(page);
+        UnlockReleaseBuffer(buf);
+
+		maxoff = PageGetMaxOffsetNumber(pageCopy);
+		for (off = FirstOffsetNumber; off <= maxoff; off++)
+		{
+			ItemId		lp;
+			BrinTuple  *tup;
+			bool		addrange = true;
+
+			lp = PageGetItemId(pageCopy, off);
+
+			if (ItemIdIsUsed(lp))
+			{
+				tup = (BrinTuple *) PageGetItem(pageCopy, lp);
+
+				if (BrinTupleIsPlaceholder(tup))
 				{
-					BrinValues *bval;
-					Datum		add;
-					Oid			collation;
+					addrange = true;
 
+				}
+
+				/*
+				 * TODO skip completely tuples with dtup->bt_blkno >= nblocks
+				 * It's not set in the bitmap, so we don't want to remove such
+				 * pages
+				 */
+				else if (BrinTupleIsEmptyRange(tup) || tup->bt_blkno >= nblocks)
+				{
+					addrange = false;
+
+				}
+				else
+				{
+					int			attno;
+
+                    dtup = brin_deform_tuple(bdesc, tup, dtup);
 					/*
-					 * skip attributes without any scan keys (both regular and
-					 * IS [NOT] NULL)
+					 * Compare scan keys with summary values stored for the
+					 * range. If scan keys are matched, the pageCopy range must be
+					 * added to the bitmap.  We initially assume the range
+					 * needs to be added; in particular this serves the case
+					 * where there are no keys.
 					 */
-					if (nkeys[attno - 1] == 0 && nnullkeys[attno - 1] == 0)
-						continue;
 
-					bval = &dtup->bt_columns[attno - 1];
-
-					/*
-					 * If the BRIN tuple indicates that this range is empty,
-					 * we can skip it: there's nothing to match.  We don't
-					 * need to examine the next columns.
-					 */
-					if (dtup->bt_empty_range)
+					addrange = true;
+					for (attno = 1; attno <= bdesc->bd_tupdesc->natts; attno++)
 					{
-						addrange = false;
-						break;
-					}
+						BrinValues *bval;
+						Datum		add;
+						Oid			collation;
 
-					/*
-					 * First check if there are any IS [NOT] NULL scan keys,
-					 * and if we're violating them. In that case we can
-					 * terminate early, without invoking the support function.
-					 *
-					 * As there may be more keys, we can only determine
-					 * mismatch within this loop.
-					 */
-					if (bdesc->bd_info[attno - 1]->oi_regular_nulls &&
-						!check_null_keys(bval, nullkeys[attno - 1],
-										 nnullkeys[attno - 1]))
-					{
 						/*
-						 * If any of the IS [NOT] NULL keys failed, the page
-						 * range as a whole can't pass. So terminate the loop.
+						 * skip attributes without any scan keys (both regular
+						 * and IS [NOT] NULL)
 						 */
-						addrange = false;
-						break;
-					}
+						if (nkeys[attno - 1] == 0 && nnullkeys[attno - 1] == 0)
+							continue;
 
-					/*
-					 * So either there are no IS [NOT] NULL keys, or all
-					 * passed. If there are no regular scan keys, we're done -
-					 * the page range matches. If there are regular keys, but
-					 * the page range is marked as 'all nulls' it can't
-					 * possibly pass (we're assuming the operators are
-					 * strict).
-					 */
+						bval = &dtup->bt_columns[attno - 1];
 
-					/* No regular scan keys - page range as a whole passes. */
-					if (!nkeys[attno - 1])
-						continue;
-
-					Assert((nkeys[attno - 1] > 0) &&
-						   (nkeys[attno - 1] <= scan->numberOfKeys));
-
-					/* If it is all nulls, it cannot possibly be consistent. */
-					if (bval->bv_allnulls)
-					{
-						addrange = false;
-						break;
-					}
-
-					/*
-					 * Collation from the first key (has to be the same for
-					 * all keys for the same attribute).
-					 */
-					collation = keys[attno - 1][0]->sk_collation;
-
-					/*
-					 * Check whether the scan key is consistent with the page
-					 * range values; if so, have the pages in the range added
-					 * to the output bitmap.
-					 *
-					 * The opclass may or may not support processing of
-					 * multiple scan keys. We can determine that based on the
-					 * number of arguments - functions with extra parameter
-					 * (number of scan keys) do support this, otherwise we
-					 * have to simply pass the scan keys one by one.
-					 */
-					if (consistentFn[attno - 1].fn_nargs >= 4)
-					{
-						/* Check all keys at once */
-						add = FunctionCall4Coll(&consistentFn[attno - 1],
-												collation,
-												PointerGetDatum(bdesc),
-												PointerGetDatum(bval),
-												PointerGetDatum(keys[attno - 1]),
-												Int32GetDatum(nkeys[attno - 1]));
-						addrange = DatumGetBool(add);
-					}
-					else
-					{
 						/*
-						 * Check keys one by one
+						 * First check if there are any IS [NOT] NULL scan
+						 * keys, and if we're violating them. In that case we
+						 * can terminate early, without invoking the support
+						 * function.
 						 *
-						 * When there are multiple scan keys, failure to meet
-						 * the criteria for a single one of them is enough to
-						 * discard the range as a whole, so break out of the
-						 * loop as soon as a false return value is obtained.
+						 * As there may be more keys, we can only determine
+						 * mismatch within this loop.
 						 */
-						int			keyno;
-
-						for (keyno = 0; keyno < nkeys[attno - 1]; keyno++)
+						if (bdesc->bd_info[attno - 1]->oi_regular_nulls &&
+							!check_null_keys(bval, nullkeys[attno - 1],
+											 nnullkeys[attno - 1]))
 						{
-							add = FunctionCall3Coll(&consistentFn[attno - 1],
-													keys[attno - 1][keyno]->sk_collation,
+							/*
+							 * If any of the IS [NOT] NULL keys failed, the
+							 * pageCopy range as a whole can't pass. So terminate
+							 * the loop.
+							 */
+							addrange = false;
+							break;
+						}
+
+						/*
+						 * So either there are no IS [NOT] NULL keys, or all
+						 * passed. If there are no regular scan keys, we're
+						 * done - the pageCopy range matches. If there are regular
+						 * keys, but the pageCopy range is marked as 'all nulls'
+						 * it can't possibly pass (we're assuming the
+						 * operators are strict).
+						 */
+
+						/*
+						 * No regular scan keys - pageCopy range as a whole
+						 * passes.
+						 */
+						if (!nkeys[attno - 1])
+							continue;
+
+						Assert((nkeys[attno - 1] > 0) &&
+							   (nkeys[attno - 1] <= scan->numberOfKeys));
+
+						/*
+						 * If it is all nulls, it cannot possibly be
+						 * consistent.
+						 */
+						if (bval->bv_allnulls)
+						{
+							addrange = false;
+							break;
+						}
+
+						/*
+						 * Collation from the first key (has to be the same
+						 * for all keys for the same attribute).
+						 */
+						collation = keys[attno - 1][0]->sk_collation;
+
+						/*
+						 * Check whether the scan key is consistent with the
+						 * pageCopy range values; if so, have the pages in the
+						 * range added to the output bitmap.
+						 *
+						 * The opclass may or may not support processing of
+						 * multiple scan keys. We can determine that based on
+						 * the number of arguments - functions with extra
+						 * parameter (number of scan keys) do support this,
+						 * otherwise we have to simply pass the scan keys one
+						 * by one.
+						 */
+						if (consistentFn[attno - 1].fn_nargs >= 4)
+						{
+							/* Check all keys at once */
+							add = FunctionCall4Coll(&consistentFn[attno - 1],
+													collation,
 													PointerGetDatum(bdesc),
 													PointerGetDatum(bval),
-													PointerGetDatum(keys[attno - 1][keyno]));
+													PointerGetDatum(keys[attno - 1]),
+													Int32GetDatum(nkeys[attno - 1]));
 							addrange = DatumGetBool(add);
-							if (!addrange)
-								break;
 						}
+						else
+						{
+							/*
+							 * Check keys one by one
+							 *
+							 * When there are multiple scan keys, failure to
+							 * meet the criteria for a single one of them is
+							 * enough to discard the range as a whole, so
+							 * break out of the loop as soon as a false return
+							 * value is obtained.
+							 */
+							int			keyno;
+
+							for (keyno = 0; keyno < nkeys[attno - 1]; keyno++)
+							{
+								add = FunctionCall3Coll(&consistentFn[attno - 1],
+														keys[attno - 1][keyno]->sk_collation,
+														PointerGetDatum(bdesc),
+														PointerGetDatum(bval),
+														PointerGetDatum(keys[attno - 1][keyno]));
+								addrange = DatumGetBool(add);
+								if (!addrange)
+									break;
+							}
+						}
+
+						/*
+						 * If we found a scan key eliminating the range, no
+						 * need to check additional ones.
+						 */
+						if (!addrange)
+							break;
 					}
 
-					/*
-					 * If we found a scan key eliminating the range, no need
-					 * to check additional ones.
-					 */
-					if (!addrange)
-						break;
 				}
+
+				if (addrange)
+				{
+					for (BlockNumber pageno = dtup->bt_blkno;
+						 pageno <= Min(nblocks, dtup->bt_blkno + opaque->bo_pagesPerRange) - 1;
+						 pageno++)
+					{
+						MemoryContextSwitchTo(oldcxt);
+						tbm_add_page(tbm, pageno);
+						MemoryContextSwitchTo(perRangeCxt);
+					}
+					totalpages += (Min(nblocks, dtup->bt_blkno + opaque->bo_pagesPerRange) - dtup->bt_blkno);
+				}
+
 			}
 		}
 
-		/* add the pages in the range to the output bitmap, if needed */
-		if (addrange)
-		{
-			BlockNumber pageno;
-
-			for (pageno = heapBlk;
-				 pageno <= Min(nblocks, heapBlk + opaque->bo_pagesPerRange) - 1;
-				 pageno++)
-			{
-				MemoryContextSwitchTo(oldcxt);
-				tbm_add_page(tbm, pageno);
-				totalpages++;
-				MemoryContextSwitchTo(perRangeCxt);
-			}
-		}
 	}
+
+	read_stream_end(stream);
 
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextDelete(perRangeCxt);
 
-	if (buf != InvalidBuffer)
-		ReleaseBuffer(buf);
 
 	/*
 	 * XXX We have an approximation of the number of *pages* that our scan
