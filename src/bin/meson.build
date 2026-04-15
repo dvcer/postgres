@@ -3,6 +3,7 @@
 subdir('initdb')
 subdir('pg_amcheck')
 subdir('pg_archivecleanup')
+subdir('pg_async_test')
 subdir('pg_basebackup')
 subdir('pg_checksums')
 subdir('pg_combinebackup')
