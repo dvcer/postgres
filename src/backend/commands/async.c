@@ -577,6 +577,8 @@ static ProcNumber *signalProcnos = NULL;
 /* have we advanced to a page that's a multiple of QUEUE_CLEANUP_DELAY? */
 static bool tryAdvanceTail = false;
 
+static bool notifyWriteLockHeldByMe = false;
+
 /* GUC parameters */
 bool		Trace_notify = false;
 
@@ -1306,8 +1308,8 @@ PreCommit_Notify(void)
 		 * (Historical note: before PG 9.0, a similar lock on "database 0" was
 		 * used by the flatfiles mechanism.)
 		 */
-		LockSharedObject(DatabaseRelationId, InvalidOid, 0,
-						 AccessExclusiveLock);
+		LWLockAcquire(NotifyWriteLock, LW_EXCLUSIVE);
+		notifyWriteLockHeldByMe = true;
 
 		/*
 		 * For the direct advancement optimization in SignalBackends(), we
@@ -1362,6 +1364,17 @@ PreCommit_Notify(void)
 	}
 }
 
+/* Release the NotifyWriteLock if we hold it */
+void
+NotifyWriteLockReleaseIfHeldByMe(void)
+{
+	if (notifyWriteLockHeldByMe)
+	{
+		LWLockRelease(NotifyWriteLock);
+		notifyWriteLockHeldByMe = false;
+	}
+}
+
 /*
  * AtCommit_Notify
  *
@@ -1374,6 +1387,7 @@ PreCommit_Notify(void)
  *		Also, if we filled enough queue pages with new notifies, try to
  *		advance the queue tail pointer.
  */
+
 void
 AtCommit_Notify(void)
 {
@@ -2417,6 +2431,9 @@ SignalBackends(void)
 void
 AtAbort_Notify(void)
 {
+	/* Release the lock if we hold it */
+	NotifyWriteLockReleaseIfHeldByMe();
+
 	/* Revert staged listen/unlisten changes */
 	ApplyPendingListenActions(false);
 

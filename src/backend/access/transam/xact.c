@@ -1489,6 +1489,13 @@ RecordTransactionCommit(void)
 							MyXactFlags,
 							InvalidTransactionId, NULL /* plain commit */ );
 
+		/*
+		 * Release the lock and let other notifiers to write notifications to
+		 * the queue. We can do it here as we have already written the commit
+		 * record, so commit order of notifications is provided
+		 */
+		NotifyWriteLockReleaseIfHeldByMe();
+
 		if (replorigin)
 			/* Move LSNs forward for this replication origin */
 			replorigin_session_advance(replorigin_xact_state.origin_lsn,
